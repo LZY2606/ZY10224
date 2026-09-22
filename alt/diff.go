@@ -5,10 +5,12 @@ package alt
 import (
 	"fmt"
 	"reflect"
+	"sort"
 	"time"
 	"unsafe"
 
 	"github.com/ohler55/ojg/gen"
+	"github.com/ohler55/ojg/internal/node"
 )
 
 // TimeTolerance is the tolerance when comparing time elements
@@ -38,15 +40,25 @@ func (p Path) String() string {
 }
 
 // Diff returns the paths to the differences between two values. Any ignore
-// paths are ignored in the comparison.
+// paths are ignored in the comparison. Differences across map members are
+// reported in sorted key order so the result does not depend on map
+// iteration order.
+//
+// Cyclic data can not be compared fully. Where a cycle is detected the
+// cyclic value is treated as nil instead of recursing until the stack
+// overflows.
 func Diff(v0, v1 any, ignores ...Path) (diffs []Path) {
-	return diff(v0, v1, false, ignores...)
+	var s0, s1 node.Session
+	return diff(v0, v1, false, &s0, &s1, node.Seg{}, ignores...)
 }
 
 // Compare returns a path to the first difference encountered between two
-// values. Any ignore paths are ignored in the comparison.
+// values. Any ignore paths are ignored in the comparison. Map members are
+// visited in sorted key order so the result does not depend on map
+// iteration order.
 func Compare(v0, v1 any, ignores ...Path) Path {
-	if diffs := diff(v0, v1, true, ignores...); 0 < len(diffs) {
+	var s0, s1 node.Session
+	if diffs := diff(v0, v1, true, &s0, &s1, node.Seg{}, ignores...); 0 < len(diffs) {
 		return diffs[0]
 	}
 	return nil
@@ -57,6 +69,34 @@ func Compare(v0, v1 any, ignores ...Path) Path {
 // explicit nil in the fingerprint will match either a nil in the target or a
 // missing value in the target.
 func Match(fingerprint, target any) bool {
+	var s0, s1 node.Session
+	return matchValue(fingerprint, target, &s0, &s1, node.Seg{})
+}
+
+// enterContainers enters both values on their respective sessions when the
+// values are containers. The returned flags are true for the values that
+// complete a cycle. Both values are left again by leaveContainers.
+func enterContainers(s0, s1 *node.Session, v0, v1 any, seg node.Seg) (c0, c1 bool) {
+	e0 := s0.Enter(v0, seg)
+	e1 := s1.Enter(v1, seg)
+	if !e0 || !e1 {
+		if e0 {
+			s0.Leave(v0)
+		}
+		if e1 {
+			s1.Leave(v1)
+		}
+		return !e0, !e1
+	}
+	return false, false
+}
+
+func leaveContainers(s0, s1 *node.Session, v0, v1 any) {
+	s0.Leave(v0)
+	s1.Leave(v1)
+}
+
+func matchValue(fingerprint, target any, s0, s1 *node.Session, seg node.Seg) bool {
 	switch fp := fingerprint.(type) {
 	case nil:
 		if target != nil {
@@ -85,39 +125,53 @@ func Match(fingerprint, target any) bool {
 			return false
 		}
 	case []any:
-		if t1, ok := target.([]any); ok && len(fp) == len(t1) {
-			for i, v := range fp {
-				if !Match(v, t1[i]) {
-					return false
-				}
-			}
-			return true
+		t1, ok := target.([]any)
+		if !ok || len(fp) != len(t1) {
+			return false
 		}
-		return false
+		if c0, c1 := enterContainers(s0, s1, fingerprint, target, seg); c0 || c1 {
+			// A cyclic value is treated as nil; both must be cyclic to
+			// match.
+			return c0 && c1
+		}
+		for i, v := range fp {
+			if !matchValue(v, t1[i], s0, s1, node.IndexSeg(i)) {
+				leaveContainers(s0, s1, fingerprint, target)
+				return false
+			}
+		}
+		leaveContainers(s0, s1, fingerprint, target)
+		return true
 	case map[string]any:
-		if t1, ok := target.(map[string]any); ok {
-			for k, v := range fp {
-				if !Match(v, t1[k]) {
-					return false
-				}
-			}
-			return true
+		t1, ok := target.(map[string]any)
+		if !ok {
+			return false
 		}
-		return false
+		if c0, c1 := enterContainers(s0, s1, fingerprint, target, seg); c0 || c1 {
+			return c0 && c1
+		}
+		for k, v := range fp {
+			if !matchValue(v, t1[k], s0, s1, node.KeySeg(k)) {
+				leaveContainers(s0, s1, fingerprint, target)
+				return false
+			}
+		}
+		leaveContainers(s0, s1, fingerprint, target)
+		return true
 	default:
 		vt0 := (*[2]uintptr)(unsafe.Pointer(&fingerprint))[0]
 		vt1 := (*[2]uintptr)(unsafe.Pointer(&target))[0]
 		if vt0 == vt1 {
-			if s0, _ := fingerprint.(Simplifier); s0 != nil {
-				if s1, _ := target.(Simplifier); s1 != nil {
-					return Match(s0.Simplify(), s1.Simplify())
+			if simp0, _ := fingerprint.(Simplifier); simp0 != nil {
+				if simp1, _ := target.(Simplifier); simp1 != nil {
+					return matchValue(simp0.Simplify(), simp1.Simplify(), s0, s1, seg)
 				}
 			}
 			opt := &Options{}
-			fingerprint = reflectValue(reflect.ValueOf(fingerprint), fingerprint, opt)
-			target = reflectValue(reflect.ValueOf(target), target, opt)
+			fingerprint = reflectValue(s0, reflect.ValueOf(fingerprint), fingerprint, opt, seg)
+			target = reflectValue(s1, reflect.ValueOf(target), target, opt, seg)
 			if fingerprint != nil && target != nil {
-				return Match(fingerprint, target)
+				return matchValue(fingerprint, target, s0, s1, seg)
 			}
 		}
 		return false
@@ -125,7 +179,7 @@ func Match(fingerprint, target any) bool {
 	return true
 }
 
-func diff(v0, v1 any, one bool, ignores ...Path) (diffs []Path) {
+func diff(v0, v1 any, one bool, s0, s1 *node.Session, seg node.Seg, ignores ...Path) (diffs []Path) {
 	switch t0 := v0.(type) {
 	case nil:
 		if v1 != nil {
@@ -159,6 +213,15 @@ func diff(v0, v1 any, one bool, ignores ...Path) (diffs []Path) {
 			diffs = append(diffs, Path{nil})
 			break
 		}
+		if c0, c1 := enterContainers(s0, s1, v0, v1, seg); c0 || c1 {
+			// A cyclic value is treated as nil; it differs from a
+			// non-cyclic value.
+			if c0 && c1 {
+				break
+			}
+			diffs = append(diffs, Path{nil})
+			break
+		}
 		var childIgnores []Path
 		ii := -1
 		for _, ign := range ignores {
@@ -178,13 +241,14 @@ func diff(v0, v1 any, one bool, ignores ...Path) (diffs []Path) {
 			}
 			if len(t1) <= i {
 				diffs = append(diffs, Path{i})
+				leaveContainers(s0, s1, v0, v1)
 				return
 			}
 			var ds []Path
 			if ii == i || ii < 0 {
-				ds = diff(m1, t1[i], one, childIgnores...)
+				ds = diff(m1, t1[i], one, s0, s1, node.IndexSeg(i), childIgnores...)
 			} else {
-				ds = diff(m1, t1[i], one)
+				ds = diff(m1, t1[i], one, s0, s1, node.IndexSeg(i))
 			}
 			for _, d := range ds {
 				if len(d) == 1 && d[0] == nil {
@@ -194,6 +258,7 @@ func diff(v0, v1 any, one bool, ignores ...Path) (diffs []Path) {
 				}
 				diffs = append(diffs, d)
 				if one {
+					leaveContainers(s0, s1, v0, v1)
 					return
 				}
 			}
@@ -201,20 +266,39 @@ func diff(v0, v1 any, one bool, ignores ...Path) (diffs []Path) {
 		if len(t0) != len(t1) && !ignoreIndex(len(t0), ignores) {
 			diffs = append(diffs, Path{len(t0)})
 		}
+		leaveContainers(s0, s1, v0, v1)
 	case map[string]any:
 		t1, ok := v1.(map[string]any)
 		if !ok {
 			diffs = append(diffs, Path{nil})
 			break
 		}
-		keys := map[string]bool{}
+		if c0, c1 := enterContainers(s0, s1, v0, v1, seg); c0 || c1 {
+			if c0 && c1 {
+				break
+			}
+			diffs = append(diffs, Path{nil})
+			break
+		}
+		// Keys of the first map are visited in sorted order followed by
+		// the sorted keys unique to the second map so the result does not
+		// depend on map iteration order. Small key sets are collected on
+		// the stack.
+		var keyBuf [16]string
+		keys := keyBuf[:0]
 		for k := range t0 {
-			keys[k] = true
+			keys = append(keys, k)
 		}
+		sort.Strings(keys)
+		var extraBuf [16]string
+		extra := extraBuf[:0]
 		for k := range t1 {
-			keys[k] = true
+			if _, ok := t0[k]; !ok {
+				extra = append(extra, k)
+			}
 		}
-		for k := range keys {
+		sort.Strings(extra)
+		for _, k := range append(keys, extra...) {
 			if ignoreKey(k, ignores) {
 				continue
 			}
@@ -233,9 +317,9 @@ func diff(v0, v1 any, one bool, ignores ...Path) (diffs []Path) {
 						}
 					}
 				}
-				ds = diff(t0[k], t1[k], one, childIgnores...)
+				ds = diff(t0[k], t1[k], one, s0, s1, node.KeySeg(k), childIgnores...)
 			} else {
-				ds = diff(t0[k], t1[k], one)
+				ds = diff(t0[k], t1[k], one, s0, s1, node.KeySeg(k))
 			}
 			for _, d := range ds {
 				if len(d) == 1 && d[0] == nil {
@@ -245,25 +329,27 @@ func diff(v0, v1 any, one bool, ignores ...Path) (diffs []Path) {
 				}
 				diffs = append(diffs, d)
 				if one {
+					leaveContainers(s0, s1, v0, v1)
 					return
 				}
 			}
 		}
+		leaveContainers(s0, s1, v0, v1)
 	default:
 		vt0 := (*[2]uintptr)(unsafe.Pointer(&v0))[0]
 		vt1 := (*[2]uintptr)(unsafe.Pointer(&v1))[0]
 		if vt0 == vt1 {
-			if s0, _ := v0.(Simplifier); s0 != nil {
-				if s1, _ := v1.(Simplifier); s1 != nil {
-					return diff(s0.Simplify(), s1.Simplify(), one, ignores...)
+			if simp0, _ := v0.(Simplifier); simp0 != nil {
+				if simp1, _ := v1.(Simplifier); simp1 != nil {
+					return diff(simp0.Simplify(), simp1.Simplify(), one, s0, s1, seg, ignores...)
 				}
 			}
 			opt := &Options{}
 			// TBD optimize by a more direct compare of fields
-			v0 = reflectValue(reflect.ValueOf(v0), v0, opt)
-			v1 = reflectValue(reflect.ValueOf(v1), v1, opt)
+			v0 = reflectValue(s0, reflect.ValueOf(v0), v0, opt, seg)
+			v1 = reflectValue(s1, reflect.ValueOf(v1), v1, opt, seg)
 			if v0 != nil && v1 != nil {
-				return diff(v0, v1, one, ignores...)
+				return diff(v0, v1, one, s0, s1, seg, ignores...)
 			}
 		}
 		diffs = append(diffs, Path{nil})

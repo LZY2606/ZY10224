@@ -9,13 +9,14 @@ import (
 	"time"
 
 	"github.com/ohler55/ojg"
+	"github.com/ohler55/ojg/internal/node"
 )
 
 // 23 for fraction in IEEE 754 which amounts to 7 significant digits. Use base
 // 10 so that numbers look correct when displayed in base 10.
 const fracMax = 10000000.0
 
-func decompose(v any, opt *Options) any {
+func decompose(v any, opt *Options, sess *node.Session, seg node.Seg) any {
 	switch tv := v.(type) {
 	case nil, bool, int64, float64, string:
 	case int:
@@ -43,16 +44,24 @@ func decompose(v any, opt *Options) any {
 		f = float64(int64(f*fracMax)) / fracMax
 		v = math.Ldexp(f, i)
 	case []any:
+		if !sess.Enter(v, seg) {
+			return nil
+		}
 		a := make([]any, len(tv))
 		for i, m := range tv {
-			a[i] = decompose(m, opt)
+			a[i] = decompose(m, opt, sess, node.IndexSeg(i))
 		}
+		sess.Leave(v)
 		v = a
 	case map[string]any:
+		if !sess.Enter(v, seg) {
+			return nil
+		}
 		o := map[string]any{}
 		for k, m := range tv {
-			condMapSet(o, k, decompose(m, opt), opt)
+			condMapSet(o, k, decompose(m, opt, sess, node.KeySeg(k)), opt)
 		}
+		sess.Leave(v)
 		v = o
 	case []byte:
 		switch opt.BytesAs {
@@ -61,7 +70,7 @@ func decompose(v any, opt *Options) any {
 		case ojg.BytesAsArray:
 			a := make([]any, len(tv))
 			for i, m := range tv {
-				a[i] = decompose(m, opt)
+				a[i] = decompose(m, opt, sess, node.IndexSeg(i))
 			}
 			v = a
 		default:
@@ -71,14 +80,14 @@ func decompose(v any, opt *Options) any {
 		v = opt.DecomposeTime(tv)
 	default:
 		if simp, _ := v.(Simplifier); simp != nil {
-			return decompose(simp.Simplify(), opt)
+			return decompose(simp.Simplify(), opt, sess, seg)
 		}
-		return reflectValue(reflect.ValueOf(v), v, opt)
+		return reflectValue(sess, reflect.ValueOf(v), v, opt, seg)
 	}
 	return v
 }
 
-func alter(v any, opt *Options) any {
+func alter(v any, opt *Options, sess *node.Session, seg node.Seg) any {
 	switch tv := v.(type) {
 	case bool, nil, int64, float64, string, time.Time:
 	case int:
@@ -106,12 +115,19 @@ func alter(v any, opt *Options) any {
 		f = float64(int64(f*fracMax)) / fracMax
 		v = math.Ldexp(f, i)
 	case []any:
-		for i, m := range tv {
-			tv[i] = alter(m, opt)
+		if !sess.Enter(v, seg) {
+			return nil
 		}
+		for i, m := range tv {
+			tv[i] = alter(m, opt, sess, node.IndexSeg(i))
+		}
+		sess.Leave(v)
 	case map[string]any:
+		if !sess.Enter(v, seg) {
+			return nil
+		}
 		for k, m := range tv {
-			mv := alter(m, opt)
+			mv := alter(m, opt, sess, node.KeySeg(k))
 			switch tmv := mv.(type) {
 			case nil:
 				if opt.OmitNil || opt.OmitEmpty {
@@ -146,6 +162,7 @@ func alter(v any, opt *Options) any {
 			}
 			tv[k] = mv
 		}
+		sess.Leave(v)
 	case []byte:
 		switch opt.BytesAs {
 		case ojg.BytesAsBase64:
@@ -153,7 +170,7 @@ func alter(v any, opt *Options) any {
 		case ojg.BytesAsArray:
 			a := make([]any, len(tv))
 			for i, m := range tv {
-				a[i] = decompose(m, opt)
+				a[i] = decompose(m, opt, sess, node.IndexSeg(i))
 			}
 			v = a
 		default:
@@ -161,50 +178,77 @@ func alter(v any, opt *Options) any {
 		}
 	default:
 		if simp, _ := v.(Simplifier); simp != nil {
-			return alter(simp.Simplify(), opt)
+			return alter(simp.Simplify(), opt, sess, seg)
 		}
-		return reflectValue(reflect.ValueOf(v), v, opt)
+		return reflectValue(sess, reflect.ValueOf(v), v, opt, seg)
 	}
 	return v
 }
 
-func reflectValue(rv reflect.Value, val any, opt *Options) (v any) {
-	switch rv.Kind() {
-	case reflect.Invalid, reflect.Uintptr, reflect.UnsafePointer, reflect.Chan, reflect.Func, reflect.Interface:
+// reflectValue converts a value outside the generic data model into simple
+// types using the shared node adapter for pointers, interfaces, aliases,
+// slices, and maps. Structs and complex numbers keep the alt specific
+// handling. The value is entered on the session for cycle detection and
+// left again before returning.
+func reflectValue(sess *node.Session, rv reflect.Value, val any, opt *Options, seg node.Seg) (v any) {
+	if !sess.Enter(val, seg) {
+		return nil
+	}
+	nv := node.Reflect(rv, val)
+	switch nv.Kind() {
+	case node.Null:
 		v = nil
-	case reflect.Complex64, reflect.Complex128:
-		v = reflectComplex(rv, opt)
-	case reflect.Map:
-		v = reflectMap(rv, opt)
-	case reflect.Pointer:
-		elem := rv.Elem()
-		if elem.IsValid() && elem.CanInterface() {
-			v = reflectValue(elem, elem.Interface(), opt)
-		} else {
+	case node.Bool:
+		v = nv.Bool()
+	case node.Int:
+		v = nv.Int()
+	case node.Uint:
+		v = nv.Uint()
+	case node.Float:
+		v = nv.Float()
+	case node.String:
+		v = nv.String()
+	case node.Array:
+		size := nv.Len()
+		a := make([]any, size)
+		for i := size - 1; 0 <= i; i-- {
+			a[i] = decompose(nv.Index(i).Raw(), opt, sess, node.IndexSeg(i))
+		}
+		v = a
+	case node.Object:
+		obj := map[string]any{}
+		nv.Each(func(key string, child node.Value) bool {
+			var g any
+			if !child.IsNil() {
+				g = decompose(child.Raw(), opt, sess, node.KeySeg(key))
+			}
+			condMapSet(obj, key, g, opt)
+			return true
+		})
+		v = obj
+	case node.Other:
+		switch urv := nv.ReflectValue(); urv.Kind() {
+		case reflect.Struct:
+			if !urv.CanInterface() {
+				v = nil
+			} else if urv.CanAddr() {
+				v = reflectStruct(sess, urv, urv.Interface(), opt)
+			} else {
+				v = reflectEmbed(sess, urv, urv.Interface(), opt)
+			}
+		case reflect.Complex64, reflect.Complex128:
+			v = reflectComplex(urv, opt)
+		default:
+			// Channels, functions, and pointers without a target can not
+			// be represented.
 			v = nil
 		}
-	case reflect.Slice, reflect.Array:
-		v = reflectArray(rv, opt)
-	case reflect.Struct:
-		v = reflectStruct(rv, val, opt)
-	case reflect.String:
-		v = rv.String()
-	case reflect.Bool:
-		v = rv.Bool()
-	case reflect.Float32, reflect.Float64:
-		v = rv.Float()
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		v = rv.Int()
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		v = rv.Uint()
 	}
+	sess.Leave(val)
 	return
 }
 
-func reflectStruct(rv reflect.Value, val any, opt *Options) any {
-	if !rv.CanAddr() {
-		return reflectEmbed(rv, val, opt)
-	}
+func reflectStruct(sess *node.Session, rv reflect.Value, val any, opt *Options) any {
 	obj := map[string]any{}
 	si := getSinfo(val, opt.OmitEmpty)
 	t := si.rt
@@ -221,9 +265,9 @@ func reflectStruct(rv reflect.Value, val any, opt *Options) any {
 		if v, fv, omit := fi.value(fi, rv, addr); !omit {
 			if fv.IsValid() {
 				if opt.NestEmbed && fv.Kind() == reflect.Struct {
-					v = reflectEmbed(fv, v, opt)
+					v = reflectEmbed(sess, fv, v, opt)
 				} else {
-					v = decompose(v, opt)
+					v = decompose(v, opt, sess, node.KeySeg(fi.key))
 				}
 			}
 			condMapSet(obj, fi.key, v, opt)
@@ -232,7 +276,7 @@ func reflectStruct(rv reflect.Value, val any, opt *Options) any {
 	return obj
 }
 
-func reflectEmbed(rv reflect.Value, val any, opt *Options) any {
+func reflectEmbed(sess *node.Session, rv reflect.Value, val any, opt *Options) any {
 	obj := map[string]any{}
 	si := getSinfo(val, opt.OmitEmpty)
 	t := si.rt
@@ -248,9 +292,9 @@ func reflectEmbed(rv reflect.Value, val any, opt *Options) any {
 		if v, fv, omit := fi.ivalue(fi, rv, 0); !omit {
 			if fv.IsValid() {
 				if opt.NestEmbed && fv.Kind() == reflect.Struct {
-					v = reflectEmbed(fv, v, opt)
+					v = reflectEmbed(sess, fv, v, opt)
 				} else {
-					v = decompose(v, opt)
+					v = decompose(v, opt, sess, node.KeySeg(fi.key))
 				}
 			}
 			condMapSet(obj, fi.key, v, opt)
@@ -269,37 +313,6 @@ func reflectComplex(rv reflect.Value, opt *Options) any {
 		obj[opt.CreateKey] = "complex"
 	}
 	return obj
-}
-
-func reflectMap(rv reflect.Value, opt *Options) any {
-	obj := map[string]any{}
-	it := rv.MapRange()
-	for it.Next() {
-		var g any
-		vv := it.Value()
-		if !isNil(vv) {
-			g = decompose(vv.Interface(), opt)
-		}
-		condMapSet(obj, ojg.KeyString(it.Key()), g, opt)
-	}
-	return obj
-}
-
-func reflectArray(rv reflect.Value, opt *Options) any {
-	size := rv.Len()
-	a := make([]any, size)
-	for i := size - 1; 0 <= i; i-- {
-		a[i] = decompose(rv.Index(i).Interface(), opt)
-	}
-	return a
-}
-
-func isNil(rv reflect.Value) bool {
-	switch rv.Kind() {
-	case reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
-		return rv.IsNil()
-	}
-	return false
 }
 
 func condMapSet(m map[string]any, key string, value any, opt *Options) {

@@ -6,6 +6,7 @@ import (
 	"reflect"
 
 	"github.com/ohler55/ojg"
+	"github.com/ohler55/ojg/internal/node"
 )
 
 // Options is an alias for ojg.Options
@@ -53,6 +54,10 @@ func Dup(v any, options ...*ojg.Options) any {
 // Decompose creates a simple type converting non simple to simple types using
 // either the Simplify() interface or reflection. Unlike Alter() a deep copy
 // is returned leaving the original data unchanged.
+//
+// Cyclic data can not be represented as simple types. Where a cycle is
+// detected the cyclic value decomposes to nil instead of recursing until
+// the stack overflows.
 func Decompose(v any, options ...*ojg.Options) any {
 	opt := &DefaultOptions
 	if 0 < len(options) {
@@ -61,7 +66,8 @@ func Decompose(v any, options ...*ojg.Options) any {
 	if opt.Converter != nil {
 		v = opt.Converter.Convert(v)
 	}
-	return decompose(v, opt)
+	var sess node.Session
+	return decompose(v, opt, &sess, node.Seg{})
 }
 
 // Alter the data into all simple types converting non simple to simple types
@@ -76,7 +82,8 @@ func Alter(v any, options ...*ojg.Options) any {
 	if opt.Converter != nil {
 		v = opt.Converter.Convert(v)
 	}
-	return alter(v, opt)
+	var sess node.Session
+	return alter(v, opt, &sess, node.Seg{})
 }
 
 // Recompose simple data into more complex go types.

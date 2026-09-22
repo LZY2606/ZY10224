@@ -3,72 +3,55 @@
 package jp
 
 import (
-	"time"
-
 	"github.com/ohler55/ojg/alt"
-	"github.com/ohler55/ojg/gen"
+	"github.com/ohler55/ojg/internal/node"
 )
 
 // Walk data and call the cb callback for each node in the data. The path is
 // reused in each call so if the path needs to be save it should be copied.
+//
+// Map and gen.Object members are visited in the native order of the
+// underlying map which is not specified. Values that implement
+// alt.Simplifier are simplified before descending. Any other value outside
+// the generic data model is reported as a leaf as is.
 func Walk(data any, cb func(path Expr, value any), justLeaves ...bool) {
 	path := Expr{Root('$')}
-	walk(path, data, cb, 0 < len(justLeaves) && justLeaves[0])
+	walk(path, node.Of(data), cb, 0 < len(justLeaves) && justLeaves[0])
 }
 
-func walk(path Expr, data any, cb func(path Expr, value any), justLeaves bool) {
+func walk(path Expr, nv node.Value, cb func(path Expr, value any), justLeaves bool) {
 top:
-	switch td := data.(type) {
-	case nil, bool, int64, float64, string,
-		int, int8, int16, int32, uint, uint8, uint16, uint32, uint64, float32,
-		[]byte, time.Time:
+	switch nv.Kind() {
+	case node.Null, node.Bool, node.Int, node.Uint, node.Float, node.String, node.Bytes, node.Time:
 		// leaf node
-		cb(path, data)
-	case []any:
+		cb(path, nv.Raw())
+	case node.Array:
 		if !justLeaves {
-			cb(path, data)
+			cb(path, nv.Raw())
 		}
 		pi := len(path)
 		path = append(path, nil)
-		for i, v := range td {
+		for i := 0; i < nv.Len(); i++ {
 			path[pi] = Nth(i)
-			walk(path, v, cb, justLeaves)
+			walk(path, nv.Index(i), cb, justLeaves)
 		}
-	case map[string]any:
+	case node.Object:
 		if !justLeaves {
-			cb(path, data)
+			cb(path, nv.Raw())
 		}
 		pi := len(path)
 		path = append(path, nil)
-		for k, v := range td {
-			path[pi] = Child(k)
-			walk(path, v, cb, justLeaves)
+		nv.Each(func(key string, child node.Value) bool {
+			path[pi] = Child(key)
+			walk(path, child, cb, justLeaves)
+			return true
+		})
+	case node.Other:
+		if simp, ok := nv.Raw().(alt.Simplifier); ok {
+			nv = node.Of(simp.Simplify())
+			goto top
 		}
-	case gen.Array:
-		if !justLeaves {
-			cb(path, data)
-		}
-		pi := len(path)
-		path = append(path, nil)
-		for i, v := range td {
-			path[pi] = Nth(i)
-			walk(path, v, cb, justLeaves)
-		}
-	case gen.Object:
-		if !justLeaves {
-			cb(path, data)
-		}
-		pi := len(path)
-		path = append(path, nil)
-		for k, v := range td {
-			path[pi] = Child(k)
-			walk(path, v, cb, justLeaves)
-		}
-	case alt.Simplifier:
-		data = td.Simplify()
-		goto top
-	default:
-		cb(path, data)
+		cb(path, nv.Raw())
 	}
 }
 

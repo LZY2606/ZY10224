@@ -6,84 +6,101 @@ import (
 	"hash/crc64"
 	"math"
 	"sort"
-	"time"
+
+	"github.com/ohler55/ojg/internal/node"
 )
 
 var emcaTable = crc64.MakeTable(crc64.ECMA)
 
 // Checksum of the provided data using a custom encoding and checksum
 // routine. The functions is most efficient with simple data.
+//
+// Map keys are sorted before encoding so the checksum does not depend on
+// map iteration order. Where a cycle is detected the cyclic value is
+// encoded as null instead of recursing until the stack overflows.
 func Checksum(v any) uint64 {
-	return crc64.Checksum(checksumAppend(nil, v), emcaTable)
+	var sess node.Session
+	return crc64.Checksum(checksumAppend(nil, v, &sess, node.Seg{}), emcaTable)
 }
 
-func checksumAppend(b []byte, v any) []byte {
-	switch tv := v.(type) {
-	case nil:
+func checksumAppend(b []byte, v any, sess *node.Session, seg node.Seg) []byte {
+top:
+	if simp, _ := v.(Simplifier); simp != nil {
+		v = simp.Simplify()
+		goto top
+	}
+	switch nv := node.Of(v); nv.Kind() {
+	case node.Null:
 		b = append(b, 0)
-	case bool:
-		if tv {
+	case node.Bool:
+		if nv.Bool() {
 			b = append(b, "true"...)
 		} else {
 			b = append(b, "false"...)
 		}
-	case int:
-		b = appendUint64(b, uint64(tv))
-	case int8:
-		b = appendUint64(b, uint64(tv))
-	case int16:
-		b = appendUint64(b, uint64(tv))
-	case int32:
-		b = appendUint64(b, uint64(tv))
-	case int64:
-		b = appendUint64(b, uint64(tv))
-	case uint:
-		b = appendUint64(b, uint64(tv))
-	case uint8:
-		b = appendUint64(b, uint64(tv))
-	case uint16:
-		b = appendUint64(b, uint64(tv))
-	case uint32:
-		b = appendUint64(b, uint64(tv))
-	case uint64:
-		b = appendUint64(b, tv)
-	case float32:
-		b = appendUint64(b, math.Float64bits(float64(tv)))
-	case float64:
-		b = appendUint64(b, math.Float64bits(tv))
-	case string:
-		b = append(b, tv...)
-	case []byte:
-		b = append(b, tv...)
-	case time.Time:
+	case node.Int:
+		b = appendUint64(b, uint64(nv.Int()))
+	case node.Uint:
+		b = appendUint64(b, nv.Uint())
+	case node.Float:
+		b = appendUint64(b, math.Float64bits(nv.Float()))
+	case node.String:
+		b = append(b, nv.String()...)
+	case node.Bytes:
+		b = append(b, nv.Bytes()...)
+	case node.Time:
+		tv := nv.Time()
 		b = appendUint64(b, uint64(tv.UnixNano()))
 		_, zone := tv.Zone()
 		b = appendUint64(b, uint64(zone))
-	case []any:
+	case node.Array:
+		if !sess.Enter(v, seg) {
+			return append(b, 0)
+		}
 		b = append(b, '[')
-		for _, v2 := range tv {
-			b = checksumAppend(b, v2)
+		for i := 0; i < nv.Len(); i++ {
+			b = checksumAppend(b, nv.Index(i).Raw(), sess, node.IndexSeg(i))
 			b = append(b, ',')
 		}
 		b = append(b, ']')
-	case map[string]any:
-		keys := make([]string, 0, len(tv))
-		for k := range tv {
-			keys = append(keys, k)
+		sess.Leave(v)
+	case node.Object:
+		if !sess.Enter(v, seg) {
+			return append(b, 0)
 		}
-		sort.Strings(keys)
-		b = append(b, '{')
-		for _, k := range keys {
-			b = append(b, k...)
-			b = append(b, ':')
-			b = checksumAppend(b, tv[k])
-			b = append(b, ',')
+		if m, ok := v.(map[string]any); ok {
+			// Fast path for the common generic map that avoids building an
+			// entry list.
+			var buf [16]string
+			keys := buf[:0]
+			for k := range m {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			b = append(b, '{')
+			for _, k := range keys {
+				b = append(b, k...)
+				b = append(b, ':')
+				b = checksumAppend(b, m[k], sess, node.KeySeg(k))
+				b = append(b, ',')
+			}
+		} else {
+			entries := nv.Entries()
+			sort.Slice(entries, func(i, j int) bool { return entries[i].Key < entries[j].Key })
+			b = append(b, '{')
+			for _, e := range entries {
+				b = append(b, e.Key...)
+				b = append(b, ':')
+				b = checksumAppend(b, e.Value.Raw(), sess, node.KeySeg(e.Key))
+				b = append(b, ',')
+			}
 		}
 		b = append(b, '}')
-	case Simplifier:
-		b = checksumAppend(b, tv.Simplify())
-	default:
-		b = checksumAppend(b, Decompose(tv))
+		sess.Leave(v)
+	case node.Other:
+		// Values outside the generic data model are decomposed with the
+		// default options, matching the original behavior.
+		b = checksumAppend(b, decompose(v, &DefaultOptions, sess, seg), sess, seg)
 	}
 	return b
 }

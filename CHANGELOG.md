@@ -5,6 +5,27 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 The structure and content of this file follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [1.28.7] - unreleased
+### Added
+- Added an internal read-only structural access layer (internal/node) that
+  classifies values into scalars, object entries, array elements, nulls,
+  and unrepresentable values. JSONPath walk, alt decompose/alter, alt
+  diff/compare/match, and alt checksum now share this single type dispatch
+  instead of maintaining separate traversal and reflection code. The
+  layer adapts reflected values lazily (pointers, interfaces, typed nils,
+  alias types, and maps with non-string keys) without copying data into
+  gen.Node.
+- Cyclic references detected while decomposing, altering, diffing,
+  matching, or checksumming reflected or generic data now terminate the
+  traversal with a defined result (the cyclic value is treated as nil)
+  instead of a stack overflow. The internal adapter records a
+  node.CycleError carrying the path to the cycle.
+
+### Changed
+- alt.Diff and alt.Compare now visit map members in a deterministic order
+  (sorted keys of the first value, then sorted keys unique to the second)
+  so results do not depend on Go map iteration order. The set of reported
+  differences is unchanged.
+
 ### Fixed
 - Fixed handling of NaN and Inf writing.
 - Moved strict option to Options to match documentation.

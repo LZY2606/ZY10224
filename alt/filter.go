@@ -3,6 +3,7 @@
 package alt
 
 import (
+	"github.com/ohler55/ojg/internal/node"
 	"reflect"
 	"strings"
 	"time"
@@ -101,7 +102,8 @@ top:
 		data = tv.Simplify()
 		goto top
 	default:
-		data = reflectValue(reflect.ValueOf(tv), tv, &Options{})
+		var sess node.Session
+		data = reflectValue(&sess, reflect.ValueOf(tv), tv, &Options{}, node.Seg{})
 		goto top
 	}
 	return
