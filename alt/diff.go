@@ -5,10 +5,12 @@ package alt
 import (
 	"fmt"
 	"reflect"
+	"sort"
 	"time"
 	"unsafe"
 
 	"github.com/ohler55/ojg/gen"
+	"github.com/ohler55/ojg/internal/node"
 )
 
 // TimeTolerance is the tolerance when comparing time elements
@@ -38,13 +40,16 @@ func (p Path) String() string {
 }
 
 // Diff returns the paths to the differences between two values. Any ignore
-// paths are ignored in the comparison.
+// paths are ignored in the comparison. Differences in maps are reported in
+// sorted key order so that Go map iteration order can not leak into the
+// result.
 func Diff(v0, v1 any, ignores ...Path) (diffs []Path) {
 	return diff(v0, v1, false, ignores...)
 }
 
 // Compare returns a path to the first difference encountered between two
-// values. Any ignore paths are ignored in the comparison.
+// values. Any ignore paths are ignored in the comparison. Map keys are
+// visited in sorted order so the result is deterministic.
 func Compare(v0, v1 any, ignores ...Path) Path {
 	if diffs := diff(v0, v1, true, ignores...); 0 < len(diffs) {
 		return diffs[0]
@@ -54,37 +59,45 @@ func Compare(v0, v1 any, ignores ...Path) Path {
 
 // Match returns true if all elements in the fingerprint match those in
 // target. Fields in target but not in the fingerprint are ignored. An
-// explicit nil in the fingerprint will match either a nil in the target or a
-// missing value in the target.
+// explicit nil in the fingerprint will match either a nil in the target or
+// a missing value in the target.
 func Match(fingerprint, target any) bool {
-	switch fp := fingerprint.(type) {
-	case nil:
+	n := node.Inspect(fingerprint)
+	switch n.Kind {
+	case node.Null:
 		if target != nil {
 			return false
 		}
-	case bool:
+	case node.Bool:
+		fp, _ := fingerprint.(bool)
 		if t1, ok := target.(bool); !ok || fp != t1 {
 			return false
 		}
-	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
-		i0, _ := asInt(fp)
+	case node.Int:
+		i0, _ := asInt(fingerprint)
 		if i1, ok := asInt(target); !ok || i0 != i1 {
 			return false
 		}
-	case float32, float64:
-		f0, _ := asFloat(fp)
+	case node.Float:
+		f0, _ := asFloat(fingerprint)
 		if f1, ok := asFloat(target); !ok || f0 != f1 {
 			return false
 		}
-	case string:
+	case node.String:
+		fp, _ := fingerprint.(string)
 		if t1, ok := target.(string); !ok || fp != t1 {
 			return false
 		}
-	case time.Time:
+	case node.Time:
+		fp, _ := fingerprint.(time.Time)
 		if t1, ok := target.(time.Time); !ok || !fp.Round(TimeTolerance).Equal(t1.Round(TimeTolerance)) {
 			return false
 		}
-	case []any:
+	case node.Array:
+		fp, ok := fingerprint.([]any)
+		if !ok {
+			return matchOther(fingerprint, target)
+		}
 		if t1, ok := target.([]any); ok && len(fp) == len(t1) {
 			for i, v := range fp {
 				if !Match(v, t1[i]) {
@@ -94,7 +107,11 @@ func Match(fingerprint, target any) bool {
 			return true
 		}
 		return false
-	case map[string]any:
+	case node.Object:
+		fp, ok := fingerprint.(map[string]any)
+		if !ok {
+			return matchOther(fingerprint, target)
+		}
 		if t1, ok := target.(map[string]any); ok {
 			for k, v := range fp {
 				if !Match(v, t1[k]) {
@@ -105,55 +122,70 @@ func Match(fingerprint, target any) bool {
 		}
 		return false
 	default:
-		vt0 := (*[2]uintptr)(unsafe.Pointer(&fingerprint))[0]
-		vt1 := (*[2]uintptr)(unsafe.Pointer(&target))[0]
-		if vt0 == vt1 {
-			if s0, _ := fingerprint.(Simplifier); s0 != nil {
-				if s1, _ := target.(Simplifier); s1 != nil {
-					return Match(s0.Simplify(), s1.Simplify())
-				}
-			}
-			opt := &Options{}
-			fingerprint = reflectValue(reflect.ValueOf(fingerprint), fingerprint, opt)
-			target = reflectValue(reflect.ValueOf(target), target, opt)
-			if fingerprint != nil && target != nil {
-				return Match(fingerprint, target)
-			}
-		}
-		return false
+		return matchOther(fingerprint, target)
 	}
 	return true
 }
 
+func matchOther(fingerprint, target any) bool {
+	vt0 := (*[2]uintptr)(unsafe.Pointer(&fingerprint))[0]
+	vt1 := (*[2]uintptr)(unsafe.Pointer(&target))[0]
+	if vt0 == vt1 {
+		if s0, _ := fingerprint.(Simplifier); s0 != nil {
+			if s1, _ := target.(Simplifier); s1 != nil {
+				return Match(s0.Simplify(), s1.Simplify())
+			}
+		}
+		opt := &Options{}
+		fingerprint = reflectValue(reflect.ValueOf(fingerprint), fingerprint, opt)
+		target = reflectValue(reflect.ValueOf(target), target, opt)
+		if fingerprint != nil && target != nil {
+			return Match(fingerprint, target)
+		}
+	}
+	return false
+}
+
 func diff(v0, v1 any, one bool, ignores ...Path) (diffs []Path) {
-	switch t0 := v0.(type) {
-	case nil:
+	n := node.Inspect(v0)
+	switch n.Kind {
+	case node.Null:
 		if v1 != nil {
 			diffs = append(diffs, Path{nil})
 		}
-	case bool:
+	case node.Bool:
+		t0, _ := v0.(bool)
 		if t1, ok := v1.(bool); !ok || t0 != t1 {
 			diffs = append(diffs, Path{nil})
 		}
-	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+	case node.Int:
 		i0, _ := asInt(v0)
 		if i1, ok := asInt(v1); !ok || i0 != i1 {
 			diffs = append(diffs, Path{nil})
 		}
-	case float32, float64:
+	case node.Float:
 		f0, _ := asFloat(v0)
 		if f1, ok := asFloat(v1); !ok || f0 != f1 {
 			diffs = append(diffs, Path{nil})
 		}
-	case string:
+	case node.String:
+		t0, _ := v0.(string)
 		if t1, ok := v1.(string); !ok || t0 != t1 {
 			diffs = append(diffs, Path{nil})
 		}
-	case time.Time:
+	case node.Time:
+		t0, _ := v0.(time.Time)
 		if t1, ok := v1.(time.Time); !ok || !t0.Round(TimeTolerance).Equal(t1.Round(TimeTolerance)) {
 			diffs = append(diffs, Path{nil})
 		}
-	case []any:
+	case node.Array:
+		// Only []any is compared as an array. A gen.Array keeps the
+		// historical behavior of being compared through its simplified
+		// form.
+		t0, ok := v0.([]any)
+		if !ok {
+			return diffOther(v0, v1, one, ignores)
+		}
 		t1, ok := v1.([]any)
 		if !ok {
 			diffs = append(diffs, Path{nil})
@@ -201,20 +233,34 @@ func diff(v0, v1 any, one bool, ignores ...Path) (diffs []Path) {
 		if len(t0) != len(t1) && !ignoreIndex(len(t0), ignores) {
 			diffs = append(diffs, Path{len(t0)})
 		}
-	case map[string]any:
+	case node.Object:
+		// Only map[string]any is compared as an object. A gen.Object
+		// keeps the historical behavior of being compared through its
+		// simplified form.
+		t0, ok := v0.(map[string]any)
+		if !ok {
+			return diffOther(v0, v1, one, ignores)
+		}
 		t1, ok := v1.(map[string]any)
 		if !ok {
 			diffs = append(diffs, Path{nil})
 			break
 		}
-		keys := map[string]bool{}
+		keySet := map[string]bool{}
 		for k := range t0 {
-			keys[k] = true
+			keySet[k] = true
 		}
 		for k := range t1 {
-			keys[k] = true
+			keySet[k] = true
 		}
-		for k := range keys {
+		keys := make([]string, 0, len(keySet))
+		for k := range keySet {
+			keys = append(keys, k)
+		}
+		// Keys are sorted so that Go map iteration order can not leak
+		// into the returned diffs.
+		sort.Strings(keys)
+		for _, k := range keys {
 			if ignoreKey(k, ignores) {
 				continue
 			}
@@ -250,25 +296,29 @@ func diff(v0, v1 any, one bool, ignores ...Path) (diffs []Path) {
 			}
 		}
 	default:
-		vt0 := (*[2]uintptr)(unsafe.Pointer(&v0))[0]
-		vt1 := (*[2]uintptr)(unsafe.Pointer(&v1))[0]
-		if vt0 == vt1 {
-			if s0, _ := v0.(Simplifier); s0 != nil {
-				if s1, _ := v1.(Simplifier); s1 != nil {
-					return diff(s0.Simplify(), s1.Simplify(), one, ignores...)
-				}
-			}
-			opt := &Options{}
-			// TBD optimize by a more direct compare of fields
-			v0 = reflectValue(reflect.ValueOf(v0), v0, opt)
-			v1 = reflectValue(reflect.ValueOf(v1), v1, opt)
-			if v0 != nil && v1 != nil {
-				return diff(v0, v1, one, ignores...)
+		return diffOther(v0, v1, one, ignores)
+	}
+	return
+}
+
+func diffOther(v0, v1 any, one bool, ignores []Path) (diffs []Path) {
+	vt0 := (*[2]uintptr)(unsafe.Pointer(&v0))[0]
+	vt1 := (*[2]uintptr)(unsafe.Pointer(&v1))[0]
+	if vt0 == vt1 {
+		if s0, _ := v0.(Simplifier); s0 != nil {
+			if s1, _ := v1.(Simplifier); s1 != nil {
+				return diff(s0.Simplify(), s1.Simplify(), one, ignores...)
 			}
 		}
-		diffs = append(diffs, Path{nil})
-		return
+		opt := &Options{}
+		// TBD optimize by a more direct compare of fields
+		v0 = reflectValue(reflect.ValueOf(v0), v0, opt)
+		v1 = reflectValue(reflect.ValueOf(v1), v1, opt)
+		if v0 != nil && v1 != nil {
+			return diff(v0, v1, one, ignores...)
+		}
 	}
+	diffs = append(diffs, Path{nil})
 	return
 }
 

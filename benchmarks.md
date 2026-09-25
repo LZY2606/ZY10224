@@ -6,6 +6,24 @@ Benchmarks were run from the ojg/cmd/benchmark directory with the command:
 go run *.go
 ```
 
+## Structural kernel migration
+
+The migration of jp.Walk, alt.Decompose/Alter, alt.Diff/Compare/Match, and
+alt.Checksum to the shared internal/node kernel was benchmarked before and
+after with `go test -bench` (Apple M5 Max, go1.26.4, median of 4-6 runs).
+Allocation counts are identical before and after; no intermediate tree
+representation is built. The small CPU delta comes from the shared, non
+inlinable classification dispatch and, for Decompose, the cycle detection
+bookkeeping.
+
+```
+Benchmark                     before                        after
+WalkBigObject     1023µs  578854 B  35287 allocs     1068µs  578849 B  35287 allocs
+WalkBigGenObject  1062µs  578849 B  35287 allocs     1128µs  578849 B  35287 allocs
+WalkBigArray      4677µs  20.0MB   78257 allocs     5234µs  20.0MB   78257 allocs
+Decompose          164ns     460 B      7 allocs      187ns     460 B      7 allocs
+```
+
 ```
 
 Parse string/[]byte

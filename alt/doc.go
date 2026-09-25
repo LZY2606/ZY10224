@@ -80,5 +80,22 @@ Nodes. It modifies the values inplace if possible by altering the original.
 	m := map[string]any{"a": 1, "b": 4, "c": 9}
 	v := alt.GenAlter(m)
 	// v:  gen.Object{"a": gen.Int(1), "b": gen.Int(4), "c": gen.Int(9)}, v)
+
+# Structural traversal
+
+Decompose, Alter, Diff, Compare, Match, and Checksum classify and traverse
+values through a shared internal read-only kernel (internal/node) so that
+null handling, integer widths, container kinds, and map key stringification
+behave identically at every entry point. Traversal is lazy: values are
+never copied into an intermediate tree representation. Checksum and Diff
+sort map keys so that Go map iteration order can not leak into their
+output while Decompose, Alter, and Match preserve the native order of each
+value.
+
+Cyclic references through reflected values (pointers, maps, and slices)
+are detected and reported as a *ojg.CycleError carrying the path to the
+cycle. Decompose and Alter panic with the error; DecomposeSafe and
+AlterSafe return it. Cycles in pure simple data ([]any and map[string]any)
+are not detected.
 */
 package alt

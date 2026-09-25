@@ -9,184 +9,327 @@ import (
 	"time"
 
 	"github.com/ohler55/ojg"
+	"github.com/ohler55/ojg/gen"
+	"github.com/ohler55/ojg/internal/node"
 )
 
 // 23 for fraction in IEEE 754 which amounts to 7 significant digits. Use base
 // 10 so that numbers look correct when displayed in base 10.
 const fracMax = 10000000.0
 
+// decCtx carries the shared state of a single Decompose or Alter
+// traversal: the cycle detection guard. The guard is armed once the
+// traversal passes through a reflected value. Pure simple data ([]any and
+// map[string]any) is not guarded to keep the simple fast path free of
+// bookkeeping; cycles in pure simple data remain unsupported as
+// documented.
+//
+// The options are passed as a separate parameter and not stored in decCtx
+// on purpose: the guard bookkeeping escapes to the heap by design and a
+// shared context struct would drag the caller's options along with it.
+type decCtx struct {
+	guard node.Guard
+	armed bool
+}
+
+// enter guards a container against cycles once the traversal is armed.
+func (ctx *decCtx) enter(v any) {
+	if !ctx.armed {
+		return
+	}
+	if err := ctx.guard.EnterValue(v); err != nil {
+		panic(err)
+	}
+}
+
+// leave balances enter.
+func (ctx *decCtx) leave(v any) {
+	if ctx.armed {
+		ctx.guard.LeaveValue(v)
+	}
+}
+
 func decompose(v any, opt *Options) any {
-	switch tv := v.(type) {
-	case nil, bool, int64, float64, string:
-	case int:
-		v = int64(tv)
-	case int8:
-		v = int64(tv)
-	case int16:
-		v = int64(tv)
-	case int32:
-		v = int64(tv)
-	case uint:
-		v = int64(tv)
-	case uint8:
-		v = int64(tv)
-	case uint16:
-		v = int64(tv)
-	case uint32:
-		v = int64(tv)
-	case uint64:
-		v = int64(tv)
-	case float32:
-		// This small rounding makes the conversion from 32 bit to 64 bit
-		// display nicer.
-		f, i := math.Frexp(float64(tv))
-		f = float64(int64(f*fracMax)) / fracMax
-		v = math.Ldexp(f, i)
-	case []any:
-		a := make([]any, len(tv))
-		for i, m := range tv {
-			a[i] = decompose(m, opt)
+	ctx := decCtx{}
+	return ctx.decomposeNode(v, node.Inspect(v), opt)
+}
+
+// decomposeKeyed decomposes a map or field value. The key is pushed onto
+// the guard path only when v can recurse (containers and reflection
+// candidates). Scalar values can not be part of a cycle and are not
+// tracked which keeps the path bookkeeping and the key boxing off the
+// scalar hot path.
+func (ctx *decCtx) decomposeKeyed(v any, key string, opt *Options) (out any) {
+	n := node.Inspect(v)
+	switch n.Kind {
+	case node.Array, node.Object, node.Simplify, node.Other:
+		ctx.guard.Push(key)
+		out = ctx.decomposeNode(v, n, opt)
+		ctx.guard.Pop()
+	default:
+		out = ctx.decomposeNode(v, n, opt)
+	}
+	return
+}
+
+// decomposeIndexed decomposes an array element. See decomposeKeyed.
+func (ctx *decCtx) decomposeIndexed(v any, index int, opt *Options) (out any) {
+	n := node.Inspect(v)
+	switch n.Kind {
+	case node.Array, node.Object, node.Simplify, node.Other:
+		ctx.guard.Push(index)
+		out = ctx.decomposeNode(v, n, opt)
+		ctx.guard.Pop()
+	default:
+		out = ctx.decomposeNode(v, n, opt)
+	}
+	return
+}
+
+func (ctx *decCtx) decomposeNode(v any, n node.Node, opt *Options) any {
+	switch n.Kind {
+	case node.Null, node.Bool, node.String:
+		// already simple
+	case node.Int:
+		v = node.Int64(v)
+	case node.Float:
+		if tv, ok := v.(float32); ok {
+			// This small rounding makes the conversion from 32 bit to 64
+			// bit display nicer.
+			f, i := math.Frexp(float64(tv))
+			f = float64(int64(f*fracMax)) / fracMax
+			v = math.Ldexp(f, i)
 		}
+	case node.Array:
+		ctx.enter(v)
+		a := make([]any, n.Len())
+		for i := range a {
+			a[i] = ctx.decomposeIndexed(n.At(i), i, opt)
+		}
+		ctx.leave(v)
 		v = a
-	case map[string]any:
+	case node.Object:
+		ctx.enter(v)
 		o := map[string]any{}
-		for k, m := range tv {
-			condMapSet(o, k, decompose(m, opt), opt)
+		// The entry loops are kept per concrete type so that no closure
+		// escapes to the heap on this hot path.
+		switch t := v.(type) {
+		case map[string]any:
+			for k, m := range t {
+				condMapSet(o, k, ctx.decomposeKeyed(m, k, opt), opt)
+			}
+		case gen.Object:
+			for k, m := range t {
+				condMapSet(o, k, ctx.decomposeKeyed(m, k, opt), opt)
+			}
 		}
+		ctx.leave(v)
 		v = o
-	case []byte:
+	case node.Bytes:
+		tv, _ := v.([]byte)
 		switch opt.BytesAs {
 		case ojg.BytesAsBase64:
 			v = base64.StdEncoding.EncodeToString(tv)
 		case ojg.BytesAsArray:
 			a := make([]any, len(tv))
 			for i, m := range tv {
-				a[i] = decompose(m, opt)
+				a[i] = ctx.decomposeNode(m, node.Inspect(m), opt)
 			}
 			v = a
 		default:
 			v = string(tv)
 		}
-	case time.Time:
+	case node.Time:
+		tv, _ := v.(time.Time)
 		v = opt.DecomposeTime(tv)
 	default:
-		if simp, _ := v.(Simplifier); simp != nil {
-			return decompose(simp.Simplify(), opt)
+		if n.Kind == node.Simplify {
+			if simp, _ := v.(Simplifier); simp != nil {
+				sv := simp.Simplify()
+				return ctx.decomposeNode(sv, node.Inspect(sv), opt)
+			}
 		}
-		return reflectValue(reflect.ValueOf(v), v, opt)
+		return ctx.reflectValue(reflect.ValueOf(v), v, opt)
 	}
 	return v
 }
 
 func alter(v any, opt *Options) any {
-	switch tv := v.(type) {
-	case bool, nil, int64, float64, string, time.Time:
-	case int:
-		v = int64(tv)
-	case int8:
-		v = int64(tv)
-	case int16:
-		v = int64(tv)
-	case int32:
-		v = int64(tv)
-	case uint:
-		v = int64(tv)
-	case uint8:
-		v = int64(tv)
-	case uint16:
-		v = int64(tv)
-	case uint32:
-		v = int64(tv)
-	case uint64:
-		v = int64(tv)
-	case float32:
-		// This small rounding makes the conversion from 32 bit to 64 bit
-		// display nicer.
-		f, i := math.Frexp(float64(tv))
-		f = float64(int64(f*fracMax)) / fracMax
-		v = math.Ldexp(f, i)
-	case []any:
-		for i, m := range tv {
-			tv[i] = alter(m, opt)
+	ctx := decCtx{}
+	return ctx.alterNode(v, node.Inspect(v), opt)
+}
+
+// alterKeyed alters a map value. See decomposeKeyed for the key tracking
+// contract.
+func (ctx *decCtx) alterKeyed(v any, key string, opt *Options) (out any) {
+	n := node.Inspect(v)
+	switch n.Kind {
+	case node.Array, node.Object, node.Simplify, node.Other:
+		ctx.guard.Push(key)
+		out = ctx.alterNode(v, n, opt)
+		ctx.guard.Pop()
+	default:
+		out = ctx.alterNode(v, n, opt)
+	}
+	return
+}
+
+// alterIndexed alters an array element. See decomposeKeyed.
+func (ctx *decCtx) alterIndexed(v any, index int, opt *Options) (out any) {
+	n := node.Inspect(v)
+	switch n.Kind {
+	case node.Array, node.Object, node.Simplify, node.Other:
+		ctx.guard.Push(index)
+		out = ctx.alterNode(v, n, opt)
+		ctx.guard.Pop()
+	default:
+		out = ctx.alterNode(v, n, opt)
+	}
+	return
+}
+
+func (ctx *decCtx) alterNode(v any, n node.Node, opt *Options) any {
+	switch n.Kind {
+	case node.Null, node.Bool, node.String, node.Time:
+		// already simple
+	case node.Int:
+		v = node.Int64(v)
+	case node.Float:
+		if tv, ok := v.(float32); ok {
+			// This small rounding makes the conversion from 32 bit to 64
+			// bit display nicer.
+			f, i := math.Frexp(float64(tv))
+			f = float64(int64(f*fracMax)) / fracMax
+			v = math.Ldexp(f, i)
 		}
-	case map[string]any:
-		for k, m := range tv {
-			mv := alter(m, opt)
-			switch tmv := mv.(type) {
-			case nil:
-				if opt.OmitNil || opt.OmitEmpty {
-					delete(tv, k)
-					continue
-				}
-			case string:
-				if opt.OmitEmpty && len(tmv) == 0 {
-					delete(tv, k)
-					continue
-				}
-			case []any:
-				if opt.OmitEmpty && len(tmv) == 0 {
-					delete(tv, k)
-					continue
-				}
-			case map[string]any:
-				if opt.OmitEmpty && len(tmv) == 0 {
-					delete(tv, k)
-					continue
-				}
-			case bool:
-				if opt.OmitEmpty && !tmv {
-					delete(tv, k)
-					continue
-				}
-			case int64:
-				if opt.OmitEmpty && tmv == 0 {
-					delete(tv, k)
-					continue
-				}
+	case node.Array:
+		// Only []any is altered in place. A gen.Array keeps the
+		// historical behavior of being replaced by its simplified form.
+		if ta, ok := v.([]any); ok {
+			ctx.enter(v)
+			for i, m := range ta {
+				ta[i] = ctx.alterIndexed(m, i, opt)
 			}
-			tv[k] = mv
+			ctx.leave(v)
+			return ta
 		}
-	case []byte:
+		return ctx.alterOther(v, opt)
+	case node.Object:
+		// Only map[string]any is altered in place. A gen.Object keeps
+		// the historical behavior of being replaced by its simplified
+		// form.
+		if tm, ok := v.(map[string]any); ok {
+			ctx.enter(v)
+			for k, m := range tm {
+				mv := ctx.alterKeyed(m, k, opt)
+				switch tmv := mv.(type) {
+				case nil:
+					if opt.OmitNil || opt.OmitEmpty {
+						delete(tm, k)
+						continue
+					}
+				case string:
+					if opt.OmitEmpty && len(tmv) == 0 {
+						delete(tm, k)
+						continue
+					}
+				case []any:
+					if opt.OmitEmpty && len(tmv) == 0 {
+						delete(tm, k)
+						continue
+					}
+				case map[string]any:
+					if opt.OmitEmpty && len(tmv) == 0 {
+						delete(tm, k)
+						continue
+					}
+				case bool:
+					if opt.OmitEmpty && !tmv {
+						delete(tm, k)
+						continue
+					}
+				case int64:
+					if opt.OmitEmpty && tmv == 0 {
+						delete(tm, k)
+						continue
+					}
+				}
+				tm[k] = mv
+			}
+			ctx.leave(v)
+			return tm
+		}
+		return ctx.alterOther(v, opt)
+	case node.Bytes:
+		tv, _ := v.([]byte)
 		switch opt.BytesAs {
 		case ojg.BytesAsBase64:
 			v = base64.StdEncoding.EncodeToString(tv)
 		case ojg.BytesAsArray:
 			a := make([]any, len(tv))
 			for i, m := range tv {
-				a[i] = decompose(m, opt)
+				a[i] = ctx.decomposeNode(m, node.Inspect(m), opt)
 			}
 			v = a
 		default:
 			v = string(tv)
 		}
 	default:
-		if simp, _ := v.(Simplifier); simp != nil {
-			return alter(simp.Simplify(), opt)
-		}
-		return reflectValue(reflect.ValueOf(v), v, opt)
+		return ctx.alterOther(v, opt)
 	}
 	return v
 }
 
-func reflectValue(rv reflect.Value, val any, opt *Options) (v any) {
+func (ctx *decCtx) alterOther(v any, opt *Options) any {
+	if simp, _ := v.(Simplifier); simp != nil {
+		sv := simp.Simplify()
+		return ctx.alterNode(sv, node.Inspect(sv), opt)
+	}
+	return ctx.reflectValue(reflect.ValueOf(v), v, opt)
+}
+
+func reflectValue(rv reflect.Value, val any, opt *Options) any {
+	ctx := decCtx{}
+	return ctx.reflectValue(rv, val, opt)
+}
+
+func (ctx *decCtx) reflectValue(rv reflect.Value, val any, opt *Options) (v any) {
+	// Arm cycle detection for the rest of the traversal. Reflected
+	// containers are always guarded; simple containers reached from here
+	// are guarded by the armed decCtx as well.
+	ctx.armed = true
 	switch rv.Kind() {
 	case reflect.Invalid, reflect.Uintptr, reflect.UnsafePointer, reflect.Chan, reflect.Func, reflect.Interface:
 		v = nil
 	case reflect.Complex64, reflect.Complex128:
-		v = reflectComplex(rv, opt)
+		v = ctx.reflectComplex(rv, opt)
 	case reflect.Map:
-		v = reflectMap(rv, opt)
+		if err := ctx.guard.Enter(rv); err != nil {
+			panic(err)
+		}
+		v = ctx.reflectMap(rv, opt)
+		ctx.guard.Leave(rv)
 	case reflect.Pointer:
+		if err := ctx.guard.Enter(rv); err != nil {
+			panic(err)
+		}
 		elem := rv.Elem()
 		if elem.IsValid() && elem.CanInterface() {
-			v = reflectValue(elem, elem.Interface(), opt)
+			v = ctx.reflectValue(elem, elem.Interface(), opt)
 		} else {
 			v = nil
 		}
-	case reflect.Slice, reflect.Array:
-		v = reflectArray(rv, opt)
+		ctx.guard.Leave(rv)
+	case reflect.Slice:
+		if err := ctx.guard.Enter(rv); err != nil {
+			panic(err)
+		}
+		v = ctx.reflectArray(rv, opt)
+		ctx.guard.Leave(rv)
+	case reflect.Array:
+		v = ctx.reflectArray(rv, opt)
 	case reflect.Struct:
-		v = reflectStruct(rv, val, opt)
+		v = ctx.reflectStruct(rv, val, opt)
 	case reflect.String:
 		v = rv.String()
 	case reflect.Bool:
@@ -201,9 +344,9 @@ func reflectValue(rv reflect.Value, val any, opt *Options) (v any) {
 	return
 }
 
-func reflectStruct(rv reflect.Value, val any, opt *Options) any {
+func (ctx *decCtx) reflectStruct(rv reflect.Value, val any, opt *Options) any {
 	if !rv.CanAddr() {
-		return reflectEmbed(rv, val, opt)
+		return ctx.reflectEmbed(rv, val, opt)
 	}
 	obj := map[string]any{}
 	si := getSinfo(val, opt.OmitEmpty)
@@ -221,9 +364,11 @@ func reflectStruct(rv reflect.Value, val any, opt *Options) any {
 		if v, fv, omit := fi.value(fi, rv, addr); !omit {
 			if fv.IsValid() {
 				if opt.NestEmbed && fv.Kind() == reflect.Struct {
-					v = reflectEmbed(fv, v, opt)
+					ctx.guard.Push(fi.key)
+					v = ctx.reflectEmbed(fv, v, opt)
+					ctx.guard.Pop()
 				} else {
-					v = decompose(v, opt)
+					v = ctx.decomposeKeyed(v, fi.key, opt)
 				}
 			}
 			condMapSet(obj, fi.key, v, opt)
@@ -232,7 +377,7 @@ func reflectStruct(rv reflect.Value, val any, opt *Options) any {
 	return obj
 }
 
-func reflectEmbed(rv reflect.Value, val any, opt *Options) any {
+func (ctx *decCtx) reflectEmbed(rv reflect.Value, val any, opt *Options) any {
 	obj := map[string]any{}
 	si := getSinfo(val, opt.OmitEmpty)
 	t := si.rt
@@ -248,9 +393,11 @@ func reflectEmbed(rv reflect.Value, val any, opt *Options) any {
 		if v, fv, omit := fi.ivalue(fi, rv, 0); !omit {
 			if fv.IsValid() {
 				if opt.NestEmbed && fv.Kind() == reflect.Struct {
-					v = reflectEmbed(fv, v, opt)
+					ctx.guard.Push(fi.key)
+					v = ctx.reflectEmbed(fv, v, opt)
+					ctx.guard.Pop()
 				} else {
-					v = decompose(v, opt)
+					v = ctx.decomposeKeyed(v, fi.key, opt)
 				}
 			}
 			condMapSet(obj, fi.key, v, opt)
@@ -259,7 +406,7 @@ func reflectEmbed(rv reflect.Value, val any, opt *Options) any {
 	return obj
 }
 
-func reflectComplex(rv reflect.Value, opt *Options) any {
+func (ctx *decCtx) reflectComplex(rv reflect.Value, opt *Options) any {
 	c := rv.Complex()
 	obj := map[string]any{
 		"real": real(c),
@@ -271,25 +418,26 @@ func reflectComplex(rv reflect.Value, opt *Options) any {
 	return obj
 }
 
-func reflectMap(rv reflect.Value, opt *Options) any {
+func (ctx *decCtx) reflectMap(rv reflect.Value, opt *Options) any {
 	obj := map[string]any{}
 	it := rv.MapRange()
 	for it.Next() {
 		var g any
 		vv := it.Value()
+		key := ojg.KeyString(it.Key())
 		if !isNil(vv) {
-			g = decompose(vv.Interface(), opt)
+			g = ctx.decomposeKeyed(vv.Interface(), key, opt)
 		}
-		condMapSet(obj, ojg.KeyString(it.Key()), g, opt)
+		condMapSet(obj, key, g, opt)
 	}
 	return obj
 }
 
-func reflectArray(rv reflect.Value, opt *Options) any {
+func (ctx *decCtx) reflectArray(rv reflect.Value, opt *Options) any {
 	size := rv.Len()
 	a := make([]any, size)
 	for i := size - 1; 0 <= i; i-- {
-		a[i] = decompose(rv.Index(i).Interface(), opt)
+		a[i] = ctx.decomposeIndexed(rv.Index(i).Interface(), i, opt)
 	}
 	return a
 }

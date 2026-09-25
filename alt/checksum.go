@@ -5,8 +5,9 @@ package alt
 import (
 	"hash/crc64"
 	"math"
-	"sort"
 	"time"
+
+	"github.com/ohler55/ojg/internal/node"
 )
 
 var emcaTable = crc64.MakeTable(crc64.ECMA)
@@ -18,72 +19,63 @@ func Checksum(v any) uint64 {
 }
 
 func checksumAppend(b []byte, v any) []byte {
-	switch tv := v.(type) {
-	case nil:
+	n := node.Inspect(v)
+	switch n.Kind {
+	case node.Null:
 		b = append(b, 0)
-	case bool:
-		if tv {
+	case node.Bool:
+		if tv, _ := v.(bool); tv {
 			b = append(b, "true"...)
 		} else {
 			b = append(b, "false"...)
 		}
-	case int:
-		b = appendUint64(b, uint64(tv))
-	case int8:
-		b = appendUint64(b, uint64(tv))
-	case int16:
-		b = appendUint64(b, uint64(tv))
-	case int32:
-		b = appendUint64(b, uint64(tv))
-	case int64:
-		b = appendUint64(b, uint64(tv))
-	case uint:
-		b = appendUint64(b, uint64(tv))
-	case uint8:
-		b = appendUint64(b, uint64(tv))
-	case uint16:
-		b = appendUint64(b, uint64(tv))
-	case uint32:
-		b = appendUint64(b, uint64(tv))
-	case uint64:
-		b = appendUint64(b, tv)
-	case float32:
-		b = appendUint64(b, math.Float64bits(float64(tv)))
-	case float64:
-		b = appendUint64(b, math.Float64bits(tv))
-	case string:
-		b = append(b, tv...)
-	case []byte:
-		b = append(b, tv...)
-	case time.Time:
+	case node.Int:
+		b = appendUint64(b, node.Uint64(v))
+	case node.Float:
+		if tv, ok := v.(float32); ok {
+			b = appendUint64(b, math.Float64bits(float64(tv)))
+		} else {
+			tv, _ := v.(float64)
+			b = appendUint64(b, math.Float64bits(tv))
+		}
+	case node.String:
+		b = append(b, v.(string)...)
+	case node.Bytes:
+		b = append(b, v.([]byte)...)
+	case node.Time:
+		tv, _ := v.(time.Time)
 		b = appendUint64(b, uint64(tv.UnixNano()))
 		_, zone := tv.Zone()
 		b = appendUint64(b, uint64(zone))
-	case []any:
+	case node.Array:
 		b = append(b, '[')
-		for _, v2 := range tv {
-			b = checksumAppend(b, v2)
-			b = append(b, ',')
+		if a, g := n.UnpackArray(); a != nil {
+			for _, v2 := range a {
+				b = checksumAppend(b, v2)
+				b = append(b, ',')
+			}
+		} else {
+			for _, v2 := range g {
+				b = checksumAppend(b, v2)
+				b = append(b, ',')
+			}
 		}
 		b = append(b, ']')
-	case map[string]any:
-		keys := make([]string, 0, len(tv))
-		for k := range tv {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
+	case node.Object:
+		// Keys are sorted so that Go map iteration order can not leak
+		// into the checksum.
 		b = append(b, '{')
-		for _, k := range keys {
+		for _, k := range n.SortedKeys() {
 			b = append(b, k...)
 			b = append(b, ':')
-			b = checksumAppend(b, tv[k])
+			b = checksumAppend(b, n.Value(k))
 			b = append(b, ',')
 		}
 		b = append(b, '}')
-	case Simplifier:
-		b = checksumAppend(b, tv.Simplify())
+	case node.Simplify:
+		b = checksumAppend(b, n.Unwrap())
 	default:
-		b = checksumAppend(b, Decompose(tv))
+		b = checksumAppend(b, Decompose(v))
 	}
 	return b
 }

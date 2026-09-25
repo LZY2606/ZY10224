@@ -53,6 +53,12 @@ func Dup(v any, options ...*ojg.Options) any {
 // Decompose creates a simple type converting non simple to simple types using
 // either the Simplify() interface or reflection. Unlike Alter() a deep copy
 // is returned leaving the original data unchanged.
+//
+// If v contains a cyclic reference through a reflected value (a pointer,
+// map, or slice that can not be expressed as simple data) Decompose panics
+// with a *ojg.CycleError carrying the path to the cycle. Use DecomposeSafe
+// to receive the cycle as an error instead. Cycles in pure simple data
+// ([]any and map[string]any) are not detected.
 func Decompose(v any, options ...*ojg.Options) any {
 	opt := &DefaultOptions
 	if 0 < len(options) {
@@ -64,10 +70,31 @@ func Decompose(v any, options ...*ojg.Options) any {
 	return decompose(v, opt)
 }
 
+// DecomposeSafe is like Decompose but returns a *ojg.CycleError as an
+// error instead of panicking when v contains a cyclic reference through a
+// reflected value.
+func DecomposeSafe(v any, options ...*ojg.Options) (out any, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if ce, ok := r.(*ojg.CycleError); ok {
+				err = ce
+			} else {
+				panic(r)
+			}
+		}
+	}()
+	out = Decompose(v, options...)
+	return
+}
+
 // Alter the data into all simple types converting non simple to simple types
 // using either the Simplify() interface or reflection. Unlike Decompose() map
 // and slice members are modified if necessary to assure all elements are
 // simple types.
+//
+// Like Decompose, Alter panics with a *ojg.CycleError if v contains a
+// cyclic reference through a reflected value. Use AlterSafe to receive the
+// cycle as an error instead.
 func Alter(v any, options ...*ojg.Options) any {
 	opt := &DefaultOptions
 	if 0 < len(options) {
@@ -77,6 +104,23 @@ func Alter(v any, options ...*ojg.Options) any {
 		v = opt.Converter.Convert(v)
 	}
 	return alter(v, opt)
+}
+
+// AlterSafe is like Alter but returns a *ojg.CycleError as an error
+// instead of panicking when v contains a cyclic reference through a
+// reflected value.
+func AlterSafe(v any, options ...*ojg.Options) (out any, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if ce, ok := r.(*ojg.CycleError); ok {
+				err = ce
+			} else {
+				panic(r)
+			}
+		}
+	}()
+	out = Alter(v, options...)
+	return
 }
 
 // Recompose simple data into more complex go types.

@@ -5,6 +5,27 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 The structure and content of this file follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [1.28.7] - unreleased
+### Added
+- Added an internal read-only structural access kernel (internal/node) that
+  the JSONPath walker (jp.Walk), the alt converters and diff (alt.Decompose,
+  alt.Alter, alt.Diff, alt.Compare, alt.Match), and alt.Checksum now share
+  for value classification and container traversal. The kernel is internal;
+  no public API was removed.
+- Added ojg.CycleError, reported when a cyclic reference is detected while
+  converting or traversing reflected values. It carries the path to the
+  cycle.
+- Added alt.DecomposeSafe and alt.AlterSafe which return a *ojg.CycleError
+  as an error instead of panicking.
+
+### Changed
+- alt.Diff and alt.Compare now report map differences in sorted key order.
+  Previously the order of differences and the result of Compare depended on
+  Go map iteration order. The set of reported differences is unchanged.
+- alt.Decompose and alt.Alter panic with a *ojg.CycleError when a cyclic
+  reference is detected through a reflected value (pointer, map, or slice).
+  Previously such input recursed until the stack overflowed. Cycles in pure
+  simple data ([]any and map[string]any) are not detected.
+
 ### Fixed
 - Fixed handling of NaN and Inf writing.
 - Moved strict option to Options to match documentation.
